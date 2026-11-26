@@ -129,11 +129,44 @@ PARAM_IDENTITY = {
     "t2m": dict(discipline=0, parameterCategory=0, parameterNumber=0, typeOfLevel="heightAboveGround", level=2),
     "d2m": dict(discipline=0, parameterCategory=0, parameterNumber=6, typeOfLevel="heightAboveGround", level=2),
     "tp": dict(discipline=0, parameterCategory=1, parameterNumber=193, typeOfLevel="surface"),
-    "tcc": dict(discipline=0, parameterCategory=6, parameterNumber=192, typeOfLevel="entireAtmosphere"),
+    # no typeOfLevel filter: that's a *name* resolved via defs tables too (unlike
+    # discipline/category/number, which are raw octets) and an old eccodes can report
+    # it as "unknown" instead of "entireAtmosphere". category/number alone is specific
+    # enough to identify cloud cover within our curated 7-parameter download.
+    "tcc": dict(discipline=0, parameterCategory=6, parameterNumber=192),
     "u10": dict(discipline=0, parameterCategory=2, parameterNumber=2, typeOfLevel="heightAboveGround", level=10),
     "v10": dict(discipline=0, parameterCategory=2, parameterNumber=3, typeOfLevel="heightAboveGround", level=10),
     "gust": dict(discipline=0, parameterCategory=2, parameterNumber=22, typeOfLevel="heightAboveGround", level=10),
 }
+
+
+def describe_grib_params(grib_path):
+    """List every distinct GRIB2 parameter identity present in the file (for diagnosing a failed lookup)."""
+    seen = {}
+    with open(grib_path, "rb") as f:
+        while True:
+            gid = eccodes.codes_grib_new_from_file(f)
+            if gid is None:
+                break
+            try:
+                info = dict(
+                    shortName=eccodes.codes_get(gid, "shortName"),
+                    paramId=eccodes.codes_get(gid, "paramId"),
+                    discipline=eccodes.codes_get(gid, "discipline"),
+                    parameterCategory=eccodes.codes_get(gid, "parameterCategory"),
+                    parameterNumber=eccodes.codes_get(gid, "parameterNumber"),
+                    typeOfLevel=eccodes.codes_get(gid, "typeOfLevel"),
+                    level=eccodes.codes_get(gid, "level"),
+                )
+                # dedup by the raw numeric identity, not shortName/paramId -- an old eccodes
+                # can resolve several genuinely different parameters to the same "unknown" name
+                key = (info["discipline"], info["parameterCategory"], info["parameterNumber"],
+                       info["typeOfLevel"], info["level"])
+                if key not in seen:
+                    seen[key] = info
+            finally:
+                eccodes.codes_release(gid)
+    return list(seen.values())
 
 
 def open_param(grib_path, name):
@@ -143,7 +176,11 @@ def open_param(grib_path, name):
         backend_kwargs={"indexpath": "", "filter_by_keys": PARAM_IDENTITY[name]},
     )
     if not ds.data_vars:
-        raise RuntimeError(f"no GRIB2 message matching {name!r} identity {PARAM_IDENTITY[name]} in {grib_path}")
+        raise RuntimeError(
+            f"no GRIB2 message matching {name!r} identity {PARAM_IDENTITY[name]} in {grib_path}\n"
+            f"parameters actually present in this file:\n"
+            + "\n".join(f"  {p}" for p in describe_grib_params(grib_path))
+        )
     return ds, ds[next(iter(ds.data_vars))]
 
 
