@@ -15,6 +15,7 @@ pipeline.log
 
 # macOS
 .DS_Store
+.claude
 
 # secrets
 .env
