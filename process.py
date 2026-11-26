@@ -33,6 +33,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 
+import eccodes
 import numpy as np
 import pymysql
 import xarray as xr
@@ -117,24 +118,77 @@ def decode_topojson(path):
     return {int(g["properties"]["ADM3_PCODE"]): to_shapely(g) for g in geoms}
 
 
+# GRIB2 numeric parameter identities (discipline, parameterCategory, parameterNumber,
+# typeOfLevel, level) for the fields we need. These are literal values encoded directly
+# in each GRIB2 message (Section 4), independent of the local eccodes/defs-tables version
+# -- unlike shortName/cfVarName/paramId, which are *resolved* from those tables and can
+# differ across eccodes versions (e.g. an older eccodes may not recognize ECMWF's local-
+# table codes for tp/tcc and fall back to an ambiguous "unknown" grouping, or may label
+# wind gust "gust" instead of "10fg"). Filtering on the raw identity sidesteps all of that.
+PARAM_IDENTITY = {
+    "t2m": dict(discipline=0, parameterCategory=0, parameterNumber=0, typeOfLevel="heightAboveGround", level=2),
+    "d2m": dict(discipline=0, parameterCategory=0, parameterNumber=6, typeOfLevel="heightAboveGround", level=2),
+    "tp": dict(discipline=0, parameterCategory=1, parameterNumber=193, typeOfLevel="surface"),
+    "tcc": dict(discipline=0, parameterCategory=6, parameterNumber=192, typeOfLevel="entireAtmosphere"),
+    "u10": dict(discipline=0, parameterCategory=2, parameterNumber=2, typeOfLevel="heightAboveGround", level=10),
+    "v10": dict(discipline=0, parameterCategory=2, parameterNumber=3, typeOfLevel="heightAboveGround", level=10),
+    "gust": dict(discipline=0, parameterCategory=2, parameterNumber=22, typeOfLevel="heightAboveGround", level=10),
+}
+
+
+def open_param(grib_path, name):
+    """Open the single GRIB2 field matching PARAM_IDENTITY[name]'s raw numeric identity."""
+    ds = xr.open_dataset(
+        grib_path, engine="cfgrib",
+        backend_kwargs={"indexpath": "", "filter_by_keys": PARAM_IDENTITY[name]},
+    )
+    if not ds.data_vars:
+        raise RuntimeError(f"no GRIB2 message matching {name!r} identity {PARAM_IDENTITY[name]} in {grib_path}")
+    return ds, ds[next(iter(ds.data_vars))]
+
+
+def distinct_param_ids(grib_path, name):
+    """All distinct paramIds in the file matching PARAM_IDENTITY[name]'s raw numeric identity.
+
+    Used for fields (wind gust) that ECMWF sometimes splits across more than one paramId
+    within a single file (e.g. the first output step re-encoded separately) -- cfgrib can't
+    merge those into one dataset (they have incompatible 'step' shapes), so each must be
+    opened on its own and combined by valid_time instead.
+    """
+    identity = PARAM_IDENTITY[name]
+    found = set()
+    with open(grib_path, "rb") as f:
+        while True:
+            gid = eccodes.codes_grib_new_from_file(f)
+            if gid is None:
+                break
+            try:
+                if all(eccodes.codes_get(gid, key) == value for key, value in identity.items()):
+                    found.add(eccodes.codes_get(gid, "paramId"))
+            finally:
+                eccodes.codes_release(gid)
+    return sorted(found)
+
+
 def load_windgust(grib_path, target_valid_time):
     """Load 10m wind gust, aligned to target_valid_time.
 
-    ECMWF splits this field across two GRIB paramIds: 49 ("fg10", the regular
-    max-since-previous-output-step field) and 228028 ("fg10_3", the same
-    quantity but re-encoded for the very first 3h step). Both are merged here
-    by valid_time; any step present in neither source is filled from the
-    nearest available step (with a warning) rather than left as NaN.
+    ECMWF sometimes splits this field across multiple GRIB paramIds within one file (e.g.
+    the regular max-since-previous-output-step series plus a separately-encoded first
+    step). All matching paramIds are merged here by valid_time; any step present in none
+    of them is filled from the nearest available step (with a warning) rather than left
+    as NaN.
     """
+    param_ids = distinct_param_ids(grib_path, "gust")
+    if not param_ids:
+        raise RuntimeError(f"no wind gust field matching {PARAM_IDENTITY['gust']} found in {grib_path}")
+
     sources = []
-    for filter_keys in ({"shortName": "10fg"}, {"paramId": 228028}):
-        try:
-            ds = xr.open_dataset(
-                grib_path, engine="cfgrib",
-                backend_kwargs={"indexpath": "", "filter_by_keys": filter_keys},
-            )
-        except Exception:
-            continue
+    for param_id in param_ids:
+        ds = xr.open_dataset(
+            grib_path, engine="cfgrib",
+            backend_kwargs={"indexpath": "", "filter_by_keys": {"paramId": param_id}},
+        )
         if not ds.data_vars:
             continue
         var = next(iter(ds.data_vars))
@@ -167,34 +221,32 @@ def load_windgust(grib_path, target_valid_time):
 
 def load_grid(grib_path):
     """Load ECMWF GRIB2 fields and derive the 7 requested parameters."""
-    ds_main = xr.open_dataset(grib_path, engine="cfgrib", backend_kwargs={"indexpath": ""})
-    ds_wind = xr.open_dataset(
-        grib_path, engine="cfgrib",
-        backend_kwargs={
-            "indexpath": "",
-            "filter_by_keys": {"typeOfLevel": "heightAboveGround", "level": 10, "stepType": "instant"},
-        },
-    )
+    ds_t2m, t2m_da = open_param(grib_path, "t2m")
+    _, d2m_da = open_param(grib_path, "d2m")
+    _, tp_da = open_param(grib_path, "tp")
+    _, tcc_da = open_param(grib_path, "tcc")
+    _, u10_da = open_param(grib_path, "u10")
+    _, v10_da = open_param(grib_path, "v10")
 
-    lats = ds_main.latitude.values
-    lons = ds_main.longitude.values
-    valid_time_utc = ds_main.valid_time.values
+    lats = ds_t2m.latitude.values
+    lons = ds_t2m.longitude.values
+    valid_time_utc = ds_t2m.valid_time.values
 
-    rf = np.clip(ds_main["tp"].values * 1000.0, a_min=0, a_max=None)  # m -> mm, accumulated since run start
-    temp = ds_main["t2m"].values - 273.15  # K -> C
-    tempdew = ds_main["d2m"].values - 273.15  # K -> C, intermediate only (for rh)
+    rf = np.clip(tp_da.values * 1000.0, a_min=0, a_max=None)  # m -> mm, accumulated since run start
+    temp = t2m_da.values - 273.15  # K -> C
+    tempdew = d2m_da.values - 273.15  # K -> C, intermediate only (for rh)
     rh = np.clip(100.0 - 5.0 * (temp - tempdew), 0.0, 100.0)  # %
-    cldcvr = np.clip(ds_main["tcc"].values * 8.0, 0.0, 8.0)  # fraction (0-1) -> Okta (0-8)
+    cldcvr = np.clip(tcc_da.values * 8.0, 0.0, 8.0)  # fraction (0-1) -> Okta (0-8)
 
-    u10 = ds_wind["u10"].values
-    v10 = ds_wind["v10"].values
+    u10 = u10_da.values
+    v10 = v10_da.values
     windspd = np.sqrt(u10 ** 2 + v10 ** 2) * 3.6  # m/s -> km/h
     winddir = np.degrees(np.arctan2(-u10, -v10)) % 360.0  # meteorological "from" direction
     windgust = load_windgust(grib_path, valid_time_utc) * 3.6  # m/s -> km/h, matched by UTC valid_time
 
     # Everything downstream (storage, day grouping) uses Bangladesh local time (UTC+6).
     valid_time = valid_time_utc + BST_OFFSET
-    forecast_run_date = (np.datetime64(ds_main.time.values) + BST_OFFSET).astype("datetime64[D]").astype(object)
+    forecast_run_date = (np.datetime64(ds_t2m.time.values) + BST_OFFSET).astype("datetime64[D]").astype(object)
 
     return {
         "lats": lats,
